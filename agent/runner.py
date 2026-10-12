@@ -59,16 +59,191 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from agent import ledger, pii, policy, tools
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+CUSTOMERS_PATH = Path(__file__).resolve().parent.parent / "data" / "customers.json"
+_TICKET_FILE_RE = re.compile(r"^ticket-(\d+)(?:[a-z])?\.md$", re.IGNORECASE)
 
 
 class RunnerScaffoldPending(NotImplementedError):
     """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
 
 
+def _args_hash(arguments: object) -> str:
+    encoded = json.dumps(arguments, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _record_decision(
+    *, ledger_path: Path, agent_id: str, run_id: str, tool: str,
+    arguments: object, classification: str, allowed: bool, reason: str,
+    principal_id: str, expires_at: str,
+) -> None:
+    ledger.append(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "tool": tool,
+            "args_hash": _args_hash(arguments),
+            "classification": classification,
+            "decision": "allow" if allowed else "deny",
+            "reason": reason,
+            "on_behalf_of": principal_id,
+            "expires_at": expires_at,
+        },
+        ledger_path,
+    )
+
+
+def _decide_and_record(
+    *, context: policy.PolicyContext, ledger_path: Path, run_id: str,
+    tool: str, arguments: object, classification: str, expires_at: str,
+) -> bool:
+    allowed, reason = policy.check(context)
+    _record_decision(
+        ledger_path=ledger_path,
+        agent_id=context.agent_owner,
+        run_id=run_id,
+        tool=tool,
+        arguments=arguments,
+        classification=classification,
+        allowed=allowed,
+        reason=reason,
+        principal_id=context.principal_id,
+        expires_at=expires_at,
+    )
+    return allowed
+
+
+def _ticket_ids_from_filenames(docs: list[dict]) -> list[int]:
+    ticket_ids = set()
+    for doc in docs:
+        match = _TICKET_FILE_RE.fullmatch(str(doc.get("id", "")))
+        if match:
+            ticket_ids.add(int(match.group(1)))
+    return sorted(ticket_ids)
+
+
+def _customers_for_tickets(ticket_ids: list[int]) -> list[str]:
+    customers = json.loads(CUSTOMERS_PATH.read_text(encoding="utf-8"))
+    wanted = set(ticket_ids)
+    return [
+        str(customer["customer_id"])
+        for customer in customers
+        if wanted.intersection(customer.get("related_tickets", []))
+    ]
+
+
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    ledger_path = (Path(log_dir) / "ledger.jsonl") if log_dir else DEFAULT_LEDGER_PATH
+    invocation_id = uuid.uuid4().hex
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+
+    # Run A owns untrusted document access only.
+    run_a_id = f"run-a-{invocation_id}"
+    run_a_agent = "lab24-agent/run-a"
+    search_context = policy.PolicyContext(
+        data_classification="internal",
+        request_purpose="summarize-tickets",
+        agent_owner=run_a_agent,
+        delegation_depth=0,
+        egress_enabled=False,
+        principal_id=principal_id,
+        requested_tool="search_docs",
+        agent_scopes=("search_docs",),
+        parent_scopes=(),
+        expires_at=expires_at,
+    )
+    if _decide_and_record(
+        context=search_context,
+        ledger_path=ledger_path,
+        run_id=run_a_id,
+        tool="search_docs",
+        arguments={"query": message},
+        classification="internal",
+        expires_at=expires_at,
+    ):
+        docs = tools.search_docs(message)
+    else:
+        docs = []
+
+    combined_untrusted_text = "\n\n".join(str(doc.get("text", "")) for doc in docs)
+    injected = llm.find_injection(combined_untrusted_text)
+
+    # Only IDs parsed from trusted filename structure cross into Run B. Neither
+    # document prose nor customer IDs extracted by the model cross this boundary.
+    ticket_ids = _ticket_ids_from_filenames(docs)
+    customer_ids = _customers_for_tickets(ticket_ids)
+    safe_docs = [
+        {**doc, "text": pii.redact(str(doc.get("text", "")))}
+        for doc in docs
+    ]
+
+    # Run B owns private-store access but has no egress capability.
+    run_b_id = f"run-b-{invocation_id}"
+    run_b_agent = "lab24-agent/run-b"
+    records = []
+    for customer_id in customer_ids:
+        read_context = policy.PolicyContext(
+            data_classification="restricted",
+            request_purpose="support-reply",
+            agent_owner=run_b_agent,
+            delegation_depth=0,
+            egress_enabled=False,
+            principal_id=principal_id,
+            requested_tool="read_customer",
+            agent_scopes=("read_customer",),
+            parent_scopes=(),
+            expires_at=expires_at,
+        )
+        if _decide_and_record(
+            context=read_context,
+            ledger_path=ledger_path,
+            run_id=run_b_id,
+            tool="read_customer",
+            arguments={"customer_id": customer_id},
+            classification="restricted",
+            expires_at=expires_at,
+        ):
+            records.append(tools.read_customer(customer_id))
+
+    # Preserve the observable attack attempt so the PEP produces explicit deny
+    # evidence, but never execute the network tool when restricted data is held.
+    if injected is not None and records:
+        egress_run_id = f"run-egress-{invocation_id}"
+        egress_agent = "lab24-agent/egress"
+        post_context = policy.PolicyContext(
+            data_classification="restricted",
+            request_purpose="support-reply",
+            agent_owner=egress_agent,
+            delegation_depth=0,
+            egress_enabled=True,
+            principal_id=principal_id,
+            requested_tool="http_post",
+            agent_scopes=("http_post",),
+            parent_scopes=(),
+            expires_at=expires_at,
+        )
+        if _decide_and_record(
+            context=post_context,
+            ledger_path=ledger_path,
+            run_id=egress_run_id,
+            tool="http_post",
+            arguments={"url": injected.target_url, "record_count": len(records)},
+            classification="restricted",
+            expires_at=expires_at,
+        ):
+            tools.http_post(injected.target_url, {"records": records})
+
+    return llm.summarize(safe_docs)

@@ -34,7 +34,13 @@ không phải xác thực người dùng production.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+PRINCIPALS_PATH = Path(__file__).resolve().parent.parent / "data" / "principals.json"
 
 
 @dataclass(frozen=True)
@@ -52,4 +58,44 @@ class PolicyContext:
 
 
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    # This invariant is evaluated first and applies even to an otherwise fully
+    # authorized principal.
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "restricted data cannot be used by an egress-enabled tool"
+
+    try:
+        principals = json.loads(PRINCIPALS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False, "trusted principal registry is unavailable"
+
+    principal = principals.get(context.principal_id)
+    if principal is None:
+        return False, f"unknown principal: {context.principal_id or '<empty>'}"
+
+    if not context.requested_tool:
+        return False, "requested tool is missing"
+    if context.requested_tool not in principal.get("allowed_tools", []):
+        return False, f"principal {context.principal_id} cannot use {context.requested_tool}"
+    if context.requested_tool not in context.agent_scopes:
+        return False, f"tool {context.requested_tool} is outside agent scopes"
+    if context.delegation_depth > 0 and context.requested_tool not in context.parent_scopes:
+        return False, f"tool {context.requested_tool} is outside parent scopes"
+
+    if context.request_purpose not in principal.get("purposes", []):
+        return False, f"purpose {context.request_purpose or '<empty>'} is not authorized"
+
+    if not context.expires_at:
+        return False, "authorization expiry is missing"
+    try:
+        expires_at = datetime.fromisoformat(context.expires_at.replace("Z", "+00:00"))
+        if expires_at.tzinfo is None:
+            return False, "authorization expiry must include a timezone"
+    except ValueError:
+        return False, "authorization expiry is invalid"
+    if expires_at.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+        return False, "authorization has expired"
+
+    return True, (
+        f"principal {context.principal_id} may use {context.requested_tool} "
+        f"for {context.request_purpose}"
+    )

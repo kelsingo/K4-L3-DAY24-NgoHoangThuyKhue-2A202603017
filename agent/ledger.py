@@ -37,12 +37,66 @@ rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 
+_GENESIS_HASH = "0" * 64
+
+
+def _hash_entry(entry: dict) -> str:
+    canonical = json.dumps(entry, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    previous_hash = _GENESIS_HASH
+    if path.exists():
+        lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if lines:
+            try:
+                previous_hash = json.loads(lines[-1])["hash"]
+            except (json.JSONDecodeError, KeyError, TypeError) as exc:
+                raise ValueError("cannot append to a malformed ledger") from exc
+
+    chained = dict(entry)
+    chained.pop("hash", None)
+    chained["prev_hash"] = previous_hash
+    chained["hash"] = _hash_entry(chained)
+
+    with path.open("a", encoding="utf-8") as ledger_file:
+        ledger_file.write(json.dumps(chained, ensure_ascii=False, sort_keys=True) + "\n")
+    return chained
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    path = Path(path)
+    if not path.exists():
+        return False
+
+    expected_previous = _GENESIS_HASH
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(entry, dict) or not entry.get("reason"):
+            return False
+        stored_hash = entry.pop("hash", None)
+        if entry.get("prev_hash") != expected_previous:
+            return False
+        if not isinstance(stored_hash, str) or _hash_entry(entry) != stored_hash:
+            return False
+        expected_previous = stored_hash
+    return True
